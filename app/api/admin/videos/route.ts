@@ -1,0 +1,13 @@
+import { NextResponse } from "next/server";
+import { getAdminFromRequest } from "../../../../db/admin-auth";
+import { createAdminVideo, listAdminVideos } from "../../../../db/admin-videos";
+import { readPortalSettings } from "../../../../db/settings";
+import { invalidatePublicListingsCache } from "../../../../db/public-listings";
+import { portalCategories } from "../../../categories";
+import { itatiaiaVideos } from "../../../itatiaia-videos";
+import { listingTitleSlug } from "../../../../lib/listing-url";
+
+function validUrl(value:string){try{const url=new URL(value);return url.protocol==="https:"||url.pathname.startsWith("/api/media/");}catch{return value.startsWith("/api/media/");}}
+async function categories(){const settings=await readPortalSettings();return Array.isArray(settings.categories)?settings.categories:portalCategories;}
+export async function GET(request:Request){if(!(await getAdminFromRequest(request)))return NextResponse.json({error:"Acesso não autorizado."},{status:401});const stored=await listAdminVideos();const homeVideos=itatiaiaVideos.map(video=>({id:`itatiaia-${video.slug}`,slug:listingTitleSlug(video.title),title:video.title,description:video.description,category:video.category||"Vídeos",subcategory:video.subcategory||"",videoUrl:video.videoUrl,videoType:"publicado na home",thumbnailUrl:video.posterUrl,status:"active",createdAt:"2026-08-18T00:00:00.000Z",static:true}));return NextResponse.json({videos:[...homeVideos,...stored.filter(item=>!homeVideos.some(video=>video.id===item.id))],categories:await categories()},{headers:{"Cache-Control":"no-store"}});}
+export async function POST(request:Request){if(!(await getAdminFromRequest(request)))return NextResponse.json({error:"Acesso não autorizado."},{status:401});const body=await request.json().catch(()=>({})) as Record<string,unknown>;const title=String(body.title||"").trim(),videoUrl=String(body.videoUrl||"").trim(),category=String(body.category||"");if(title.length<3||!validUrl(videoUrl))return NextResponse.json({error:"Informe um título e selecione um vídeo ou URL válida."},{status:400});const catalog=await categories() as Array<{name:string;subs:string[]}>;const parent=catalog.find(item=>item.name===category);const subcategory=String(body.subcategory||"");if(category&&(!parent||(subcategory&&!parent.subs.includes(subcategory))))return NextResponse.json({error:"Categoria ou subcategoria inválida."},{status:400});const video=await createAdminVideo({title,description:String(body.description||"").trim(),category,subcategory,videoUrl,videoType:String(body.videoType||"url"),thumbnailUrl:String(body.thumbnailUrl||"").trim(),status:body.status==="inactive"?"inactive":"active"});invalidatePublicListingsCache();return NextResponse.json({video},{status:201});}

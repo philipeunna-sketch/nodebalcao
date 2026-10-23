@@ -1,0 +1,2 @@
+import {NextResponse} from "next/server";import {recordBannerEvent} from "../../../../db/banners";
+export async function POST(request:Request){const body=await request.json().catch(()=>({})) as Record<string,unknown>;await recordBannerEvent({bannerId:String(body.bannerId||""),eventType:String(body.eventType||""),sessionId:String(body.sessionId||"anonymous"),pagePath:String(body.pagePath||"/")});return NextResponse.json({ok:true});}

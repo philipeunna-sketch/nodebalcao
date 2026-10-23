@@ -1,0 +1,204 @@
+import { NextResponse } from "next/server";
+import { getAdminFromRequest } from "../../../db/admin-auth";
+import { getCustomerByIdForAdmin, getCustomerBySessionToken, onlyDigits, readCustomerCookie } from "../../../db/customer-auth";
+import { confirmFeaturedPayment, createListing, getAdminListingMetadata, setListingPaymentReference, setListingPaymentStatus } from "../../../db/listings";
+import { createMercadoPagoCard, createMercadoPagoPix, getMercadoPagoConfiguration, mercadoPagoLocalStatus } from "../../../db/mercadopago";
+import { createPaymentRecord } from "../../../db/payments";
+import { readPortalSettings, readPrivateSetting } from "../../../db/settings";
+import { sendListingCopy } from "../../../db/verification-delivery";
+import { getHomeListings, getPublicListings, searchPublicListings } from "../../../db/public-listings";
+import { classifyListingWithOpenAI } from "../../../db/openai";
+import { portalCategories } from "../../categories";
+import { getFeaturedPlan } from "../../featured-plans";
+import { createListingInvoice } from "../../../db/invoices";
+import { plainListingDescription } from "../../../lib/listing-description";
+
+type UnknownRecord = Record<string, unknown>;
+function text(value: unknown) { return typeof value === "string" ? value.trim() : value == null ? "" : String(value); }
+function searchText(value: string) { return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase(); }
+export async function GET(request: Request) {
+  const includePending = Boolean(await getAdminFromRequest(request));
+  const url = new URL(request.url);
+  const fresh = url.searchParams.get("fresh") === "1";
+  const homeView = !includePending && url.searchParams.get("view") === "home";
+  const query = text(url.searchParams.get("search") || url.searchParams.get("busca")).slice(0, 120);
+  if (query && !includePending) {
+    const requestedLimit = Number(url.searchParams.get("limit") || 5);
+    const requestedOffset = Number(url.searchParams.get("offset") || 0);
+    const limit = Math.min(100, Math.max(1, Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : 5));
+    const offset = Math.min(100_000, Math.max(0, Number.isFinite(requestedOffset) ? Math.trunc(requestedOffset) : 0));
+    const result = await searchPublicListings(query, { limit, offset });
+    return NextResponse.json(
+      { data: result.data, total: result.total, source: "database" },
+      { headers: { "Cache-Control": fresh ? "no-store" : "public, max-age=30, s-maxage=60" } },
+    );
+  }
+  let listings: Awaited<ReturnType<typeof getPublicListings>>;
+  if (includePending) {
+    const [publicListings, managedListings] = await Promise.all([
+      getPublicListings({ fresh }),
+      getPublicListings({ includePending: true, fresh }),
+    ]);
+    listings = [...new Map([...publicListings, ...managedListings].map((item) => [item.id, item])).values()];
+  } else {
+    listings = homeView
+      ? await getHomeListings({ regularLimit: 180, storeLimit: 30, fresh })
+      : await getPublicListings({ fresh });
+  }
+  if (query) {
+    const phrase = searchText(query);
+    const terms = [...new Set(phrase.replace(/[^a-z0-9\s-]/g, " ").split(/\s+/).filter((term) => term.length >= 2))].slice(0, 8);
+    const score = (item: (typeof listings)[number]) => {
+      const title = searchText(item.title);
+      const category = searchText(`${item.category} ${item.subcategory}`);
+      const details = searchText(`${item.description} ${item.locationLabel}`);
+      let value = phrase.length >= 2 && title.includes(phrase) ? 100 : 0;
+      for (const term of terms) {
+        if (title === term) value += 45;
+        else if (title.startsWith(term)) value += 28;
+        else if (title.includes(term)) value += 18;
+        if (category.includes(term)) value += 9;
+        if (details.includes(term)) value += 4;
+      }
+      if (item.featured) value += 3;
+      return value;
+    };
+    const limit = Math.min(10, Math.max(1, Number(url.searchParams.get("limit") || 5) || 5));
+    listings = listings.map((item) => ({ item, score: score(item) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => Number(b.item.featured) - Number(a.item.featured) || b.score - a.score || Date.parse(b.item.createdAt || "") - Date.parse(a.item.createdAt || ""))
+      .slice(0, limit)
+      .map(({ item }) => item);
+  }
+  if (includePending) {
+    const metadata = await getAdminListingMetadata(listings.map((item) => item.id));
+    listings = listings.map((item) => ({ ...item, seller: { ...item.seller, ...metadata.get(item.id), email: metadata.get(item.id)?.sellerEmail }, analytics: metadata.get(item.id) }));
+  }
+  return NextResponse.json(
+    { data: listings, total: listings.length, source: "database" },
+    { headers: { "Cache-Control": includePending || fresh ? "no-store" : query ? "public, max-age=30, s-maxage=60" : "public, max-age=60, s-maxage=300, stale-while-revalidate=86400" } },
+  );
+}
+function optionalCents(value: unknown) { if (value === null || value === undefined || value === "") return null; const number = Number(value); return Number.isInteger(number) && number >= 0 ? number : null; }
+function safeVideoUrl(value: unknown) {
+  const candidate = text(value).slice(0, 500);
+  if (!candidate) return "";
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== "https:") return null;
+    const host = url.hostname.replace(/^www\./, "");
+    const knownProvider = host === "youtu.be" || host.endsWith("youtube.com") || host.endsWith("youtube-nocookie.com") || host.endsWith("vimeo.com");
+    const directVideo = /\.(mp4|webm)$/i.test(url.pathname);
+    return knownProvider || directVideo ? url.toString() : null;
+  } catch { return null; }
+}
+export async function POST(request: Request) {
+  const payload = await request.json().catch(() => ({})) as UnknownRecord;
+  const admin = await getAdminFromRequest(request);
+  const adminTargetId = Number(payload.adminUserId || 0);
+  const adminDirect = Boolean(admin && Number.isInteger(adminTargetId) && adminTargetId > 0);
+  const customer = adminDirect ? await getCustomerByIdForAdmin(adminTargetId) : await getCustomerBySessionToken(readCustomerCookie(request)); if (!customer) return NextResponse.json({ error: "Selecione um anunciante válido ou entre na conta para publicar." }, { status: 401 });
+  const title = text(payload.title); const description = text(payload.description); let category = text(payload.category); let subcategory = text(payload.subcategory); const negotiationType = text(payload.negotiationType); const address = text(payload.address); const displayName = text(payload.displayName); const whatsapp = onlyDigits(text(payload.whatsapp));
+  const ownedImagePrefix = `/api/media/${encodeURIComponent(`listing-drafts/${customer.id}/`)}`; const images = Array.isArray(payload.images) ? payload.images.map(text).filter((item) => item.startsWith(ownedImagePrefix)).slice(0, 12) : [];
+  const publicationType = payload.publicationType === "featured" ? "featured" : "free";
+  const isPromoted = publicationType === "featured";
+  const requiresPayment = isPromoted && !adminDirect;
+  const featuredPlanCode = isPromoted && typeof payload.featuredPlan === "string" ? payload.featuredPlan : "";
+  const paymentMethod = payload.paymentMethod === "card" ? "CREDIT_CARD" : "PIX";
+  const encryptedCard = text(payload.encryptedCard);
+  const cardHolderName = text(payload.cardHolderName);
+  const cardInstallments = Number(payload.cardInstallments || 1);
+  const settings = await readPortalSettings(); const configuredCategories = Array.isArray(settings.categories) ? settings.categories.flatMap((item) => { if (!item || typeof item !== "object") return []; const record = item as Record<string, unknown>; return typeof record.name === "string" && Array.isArray(record.subs) ? [{ name: record.name, subs: record.subs.filter((value): value is string => typeof value === "string") }] : []; }) : portalCategories; const knownCategory = configuredCategories.find((item) => item.name === category);
+  if (title.length < 8 || title.length > 120) return NextResponse.json({ error: "Informe um título entre 8 e 120 caracteres." }, { status: 400 });
+  const descriptionLength = plainListingDescription(description).length;
+  if (descriptionLength < 30 || descriptionLength > 5_000 || description.length > 20_000) return NextResponse.json({ error: "A descrição deve ter entre 30 e 5.000 caracteres." }, { status: 400 });
+  if (!knownCategory || !knownCategory.subs.includes(subcategory)) return NextResponse.json({ error: "Selecione uma categoria e subcategoria válidas." }, { status: 400 });
+  if (await readPrivateSetting("openai_api_key")) {
+    try {
+      const reviewed = await classifyListingWithOpenAI({ title, description: plainListingDescription(description), currentCategory: category, currentSubcategory: subcategory, categories: configuredCategories });
+      category = reviewed.category; subcategory = reviewed.subcategory;
+    } catch { /* A falha da IA não impede que o usuário salve o anúncio. */ }
+  }
+  const baseFeaturedPlan = isPromoted ? getFeaturedPlan(category, featuredPlanCode, subcategory) : undefined;
+  const selectedFeaturedPlan = baseFeaturedPlan;
+  const featuredPlan = selectedFeaturedPlan?.code ?? null;
+  const paymentConfiguration = await getMercadoPagoConfiguration();
+  if (requiresPayment && !paymentConfiguration.enabled) return NextResponse.json({ error: "Os pagamentos estão desativados. Escolha o anúncio grátis ou ative o Mercado Pago no painel administrativo." }, { status: 503 });
+  if (requiresPayment && paymentMethod === "PIX" && !paymentConfiguration.pixEnabled) return NextResponse.json({ error: "O pagamento por Pix está desativado." }, { status: 400 });
+  if (requiresPayment && paymentMethod === "CREDIT_CARD" && !paymentConfiguration.cardEnabled) return NextResponse.json({ error: "O pagamento por cartão está desativado." }, { status: 400 });
+  if (requiresPayment && paymentMethod === "CREDIT_CARD" && (encryptedCard.length < 20 || encryptedCard.length > 8_000 || cardHolderName.length < 3 || !text(payload.mpPaymentMethodId))) return NextResponse.json({ error: "Confira os dados do cartão e tente novamente." }, { status: 400 });
+  if (requiresPayment && paymentMethod === "CREDIT_CARD" && (!Number.isInteger(cardInstallments) || cardInstallments < 1 || cardInstallments > 3)) return NextResponse.json({ error: "Selecione uma opção válida de parcelamento." }, { status: 400 });
+  if (!["Compra", "Venda", "Troca", "Aluguel", "Temporada", "Serviço", "Outra"].includes(negotiationType)) return NextResponse.json({ error: "Selecione o tipo de negociação." }, { status: 400 });
+  if (!address || typeof payload.latitude !== "number" || typeof payload.longitude !== "number") return NextResponse.json({ error: "Selecione um endereço válido na busca." }, { status: 400 });
+  if (displayName.length < 2 || whatsapp.length < 10 || whatsapp.length > 13) return NextResponse.json({ error: "Informe o nome de exibição e um WhatsApp válido." }, { status: 400 });
+  if (images.length < 1 || images.length > 12) return NextResponse.json({ error: "Adicione de 1 a 12 fotos ao anúncio." }, { status: 400 });
+  if (isPromoted && !featuredPlan) return NextResponse.json({ error: "Selecione um período de destaque." }, { status: 400 });
+  const negotiable = payload.negotiable === true; const priceCents = optionalCents(payload.priceCents); const monthlyRentCents = optionalCents(payload.monthlyRentCents);
+  if (!negotiable && negotiationType === "Aluguel" && monthlyRentCents == null) return NextResponse.json({ error: "Informe o valor mensal do aluguel." }, { status: 400 });
+  if (!negotiable && negotiationType !== "Aluguel" && priceCents == null) return NextResponse.json({ error: "Informe o valor do anúncio." }, { status: 400 });
+  const rawAttributes = payload.attributes && typeof payload.attributes === "object" && !Array.isArray(payload.attributes) ? payload.attributes as Record<string, unknown> : {};
+  const videoUrl = safeVideoUrl(rawAttributes.videoUrl);
+  if (videoUrl === null) return NextResponse.json({ error: "Use um link HTTPS válido do YouTube, Vimeo ou de um arquivo MP4/WebM." }, { status: 400 });
+  const attributeEntries: Array<[string, string | number | boolean]> = [];
+  for (const [key, value] of Object.entries(rawAttributes).slice(0, 30)) {
+    if (key === "videoUrl") continue;
+    if (!/^[a-zA-Z][a-zA-Z0-9]{0,39}$/.test(key)) continue;
+    if (typeof value === "boolean" || typeof value === "number") attributeEntries.push([key, value]);
+    else if (typeof value === "string") attributeEntries.push([key, value.slice(0, 160)]);
+  }
+  if (videoUrl) attributeEntries.push(["videoUrl", videoUrl]);
+  const attributes = Object.fromEntries(attributeEntries) as Record<string, string | number | boolean>;
+  const features = Array.isArray(payload.features) ? payload.features.map(text).filter(Boolean).slice(0, 20) : [];
+  const created = await createListing(customer, { title, description, negotiationType, category, subcategory, priceCents: negotiable ? null : priceCents, monthlyRentCents: negotiable ? null : monthlyRentCents, iptuCents: optionalCents(payload.iptuCents), condoCents: optionalCents(payload.condoCents), negotiable, address, latitude: payload.latitude, longitude: payload.longitude, displayName, whatsapp, attributes, features, images, publicationType, featuredPlan, paymentMethod: requiresPayment ? paymentMethod : null, paymentAmountCents: requiresPayment ? selectedFeaturedPlan?.amountCents ?? null : 0, paymentProvider: requiresPayment ? "mercadopago" : null, skipPayment: adminDirect });
+  if ("error" in created) return NextResponse.json({ error: created.error }, { status: 409 });
+  let qrCodeText: string | undefined; let qrCodeImage: string | undefined; let paymentExpiresAt: string | undefined; let paymentUnavailable = false; let paid = false; let paymentStatus = isPromoted ? "pending" : null; let cardBrand: string | null = null; let cardLast4: string | null = null;
+  if (requiresPayment && selectedFeaturedPlan) {
+    try {
+      const origin = new URL(request.url).origin;
+      const paymentInput = { listingId: created.id, planLabel: selectedFeaturedPlan.label.toLowerCase(), amountCents: selectedFeaturedPlan.amountCents, origin, customer: { name: customer.name, email: customer.email, taxId: customer.taxId, whatsapp: customer.whatsapp } };
+      if (paymentMethod === "PIX") {
+        const pix = await createMercadoPagoPix(paymentInput);
+        await setListingPaymentReference(created.id, pix.orderId, pix.expiresAt);
+        await createPaymentRecord({ userId: customer.id, listingId: created.id, providerReference: pix.orderId, method: "PIX", amountCents: selectedFeaturedPlan.amountCents, status: "pending", providerStatus: "WAITING", planCode: selectedFeaturedPlan.code, planLabel: selectedFeaturedPlan.label, description: `Destaque ${selectedFeaturedPlan.label}`, expiresAt: pix.expiresAt });
+        qrCodeText = pix.qrCodeText; qrCodeImage = pix.qrCodeImage; paymentExpiresAt = pix.expiresAt;
+      } else {
+        const card = await createMercadoPagoCard({ ...paymentInput, cardToken: encryptedCard, paymentMethodId: text(payload.mpPaymentMethodId), issuerId: text(payload.mpIssuerId) || undefined, installments: cardInstallments });
+        await setListingPaymentReference(created.id, card.orderId);
+        cardBrand = card.cardBrand; cardLast4 = card.cardLast4; paid = card.paid;
+        paymentStatus = mercadoPagoLocalStatus(card.status);
+        await setListingPaymentStatus(created.id, paymentStatus);
+        await createPaymentRecord({ userId: customer.id, listingId: created.id, providerReference: card.orderId, method: "CREDIT_CARD", amountCents: selectedFeaturedPlan.amountCents, status: paymentStatus as "pending" | "paid" | "declined" | "expired", providerStatus: card.status, planCode: selectedFeaturedPlan.code, planLabel: selectedFeaturedPlan.label, description: `Destaque ${selectedFeaturedPlan.label}`, cardBrand: card.cardBrand, cardLast4: card.cardLast4, paidAt: card.paidAt });
+        if (card.paid) await confirmFeaturedPayment(card.orderId);
+      }
+    } catch {
+      paymentUnavailable = true;
+      paymentStatus = "failed";
+      await setListingPaymentStatus(created.id, "failed");
+      await createPaymentRecord({ userId: customer.id, listingId: created.id, method: paymentMethod, amountCents: selectedFeaturedPlan.amountCents, status: "failed", providerStatus: "INTEGRATION_ERROR", planCode: selectedFeaturedPlan.code, planLabel: selectedFeaturedPlan.label, description: `Destaque ${selectedFeaturedPlan.label}` }).catch(() => undefined);
+    }
+  }
+  await createListingInvoice({
+    userId: customer.id,
+    listingId: created.id,
+    listingTitle: title,
+    publicationType,
+    planLabel: selectedFeaturedPlan?.label || null,
+    amountCents: adminDirect ? 0 : selectedFeaturedPlan?.amountCents || 0,
+    paymentMethod: requiresPayment ? paymentMethod : null,
+    status: adminDirect || publicationType === "free" || paid ? "paid" : paymentUnavailable || paymentStatus === "failed" || paymentStatus === "declined" || paymentStatus === "expired" ? "failed" : "pending",
+  }).catch(() => undefined);
+  const valueCents = negotiable ? null : monthlyRentCents ?? priceCents; const priceLabel = valueCents == null ? "Valor a combinar" : `${(valueCents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}${negotiationType === "Aluguel" ? "/mês" : ""}`;
+  const emailSent = await sendListingCopy({ email: customer.email, name: customer.name, listingId: created.id, listingSlug: created.slug, title, category, priceLabel, address, statusLabel: adminDirect ? "Inserido pela administração e pendente de revisão" : isPromoted ? "Aguardando pagamento do destaque" : "Pendente de revisão" }).then(() => true).catch(() => false);
+  const message = adminDirect ? `Anúncio inserido com sucesso na conta de ${customer.name}.` : isPromoted
+    ? paymentUnavailable
+      ? "Anúncio salvo na sua conta, mas o Mercado Pago não conseguiu processar o pagamento. Confira a integração e tente novamente."
+      : paid
+        ? "Pagamento aprovado. O anúncio foi enviado para revisão."
+        : paymentStatus === "declined"
+          ? "Pagamento não aprovado. O anúncio foi salvo e a tentativa está disponível em Meus Pagamentos."
+          : paymentMethod === "PIX"
+            ? "Anúncio salvo com sucesso. Leia o QR Code abaixo para concluir o pagamento."
+            : "Pagamento recebido e em processamento. A situação será atualizada automaticamente."
+    : "Anúncio cadastrado com sucesso! Ele será revisado pela nossa equipe para publicação.";
+  return NextResponse.json({ ok: true, listingId: created.id, listingSlug: created.slug, status: paid ? "pending_review" : created.status, publicationType, qrCodeText, qrCodeImage, paymentExpiresAt, paymentUnavailable, paid, paymentStatus: adminDirect ? "paid" : paymentStatus, cardBrand, cardLast4, paymentMethod: requiresPayment ? paymentMethod : null, paymentAmountCents: requiresPayment ? selectedFeaturedPlan?.amountCents ?? null : 0, featuredPlan, durationDays: selectedFeaturedPlan?.durationDays ?? 30, emailSent, adminDirect, message }, { status: paymentUnavailable ? 202 : 201 });
+}

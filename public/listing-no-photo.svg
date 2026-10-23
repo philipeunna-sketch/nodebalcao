@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600" role="img" aria-labelledby="title description">
+  <title id="title">Foto não disponível</title>
+  <desc id="description">Ilustração cinza de uma câmera indicando que o anúncio não possui foto.</desc>
+  <rect width="800" height="600" fill="#f1f2f4"/>
+  <rect x="1" y="1" width="798" height="598" rx="22" fill="none" stroke="#e1e3e6" stroke-width="2"/>
+  <g transform="translate(248 156)" fill="none" stroke="#9ca1a8" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M80 52l25-38h94l25 38h47c19 0 34 15 34 34v142c0 19-15 34-34 34H34c-19 0-34-15-34-34V86c0-19 15-34 34-34h46z"/>
+    <circle cx="152" cy="157" r="62"/>
+    <path d="M28 280L277 8" stroke="#858b93" stroke-width="28"/>
+  </g>
+  <text x="400" y="500" fill="#858b93" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="700" letter-spacing="2" text-anchor="middle">FOTO NÃO DISPONÍVEL</text>
+</svg>

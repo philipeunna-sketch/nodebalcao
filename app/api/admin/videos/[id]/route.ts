@@ -1,0 +1,9 @@
+import { NextResponse } from "next/server";
+import { getAdminFromRequest } from "../../../../../db/admin-auth";
+import { deleteAdminVideo, updateAdminVideo } from "../../../../../db/admin-videos";
+import { invalidatePublicListingsCache } from "../../../../../db/public-listings";
+
+function validUrl(value:string){try{const url=new URL(value);return url.protocol==="https:"||url.pathname.startsWith("/api/media/");}catch{return value.startsWith("/api/media/");}}
+
+export async function PUT(request:Request,{params}:{params:Promise<{id:string}>}){if(!(await getAdminFromRequest(request)))return NextResponse.json({error:"Acesso não autorizado."},{status:401});const {id}=await params;const body=await request.json().catch(()=>({})) as Record<string,unknown>;const title=String(body.title||"").trim(),videoUrl=String(body.videoUrl||"").trim();if(title.length<3||!validUrl(videoUrl))return NextResponse.json({error:"Informe um título e selecione um vídeo ou URL válida."},{status:400});const video=await updateAdminVideo(id,{title,description:String(body.description||"").trim(),category:String(body.category||""),subcategory:String(body.subcategory||""),videoUrl,videoType:String(body.videoType||"url"),thumbnailUrl:String(body.thumbnailUrl||"").trim(),status:body.status==="inactive"?"inactive":"active"});if(!video)return NextResponse.json({error:"Vídeo não encontrado."},{status:404});invalidatePublicListingsCache();return NextResponse.json({video});}
+export async function DELETE(request:Request,{params}:{params:Promise<{id:string}>}){if(!(await getAdminFromRequest(request)))return NextResponse.json({error:"Acesso não autorizado."},{status:401});const {id}=await params;const deleted=await deleteAdminVideo(id);if(!deleted)return NextResponse.json({error:"Vídeo não encontrado."},{status:404});invalidatePublicListingsCache();return NextResponse.json({ok:true});}

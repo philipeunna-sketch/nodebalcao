@@ -1,0 +1,327 @@
+import type { PortalCategory } from "../app/categories";
+import { mapCategory, portalCategories } from "../app/categories";
+import { ensureImportCustomer, IMPORT_ACCOUNT_EMAIL } from "./customer-auth";
+import { ensureListingTables } from "./listings";
+import { writePortalSettings } from "./settings";
+import { LISTING_IMAGE_PLACEHOLDER, normalizeListingImages } from "../lib/listing-images";
+import { ensureListingSlugs, storedListingKey } from "./listing-slugs";
+
+export type UnknownListingSourceRecord = Record<string, unknown>;
+export type ImportRecord = {
+  id: string; title: string; description: string; category: string; subcategory: string;
+  priceCents: number | null; negotiable: boolean; images: string[]; displayName: string; whatsapp: string;
+  createdAt: string; sourceId: string; sourceUrl: string; sourceCategories: string[];
+};
+
+function text(value: unknown) { return typeof value === "string" ? value.trim() : value == null ? "" : String(value); }
+function first(source: UnknownListingSourceRecord, keys: string[]) { for (const key of keys) if (source[key] != null && source[key] !== "") return source[key]; }
+function slug(value: string, index: number) { return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 100) || `anuncio-${index + 1}`; }
+function nestedImageValues(value: unknown, depth = 0): string[] {
+  if (depth > 4 || value == null) return [];
+  if (typeof value === "string") return [value.trim()];
+  if (Array.isArray(value)) return value.flatMap((item) => nestedImageValues(item, depth + 1));
+  if (typeof value !== "object") return [];
+  const record = value as UnknownListingSourceRecord;
+  const keys = ["url", "src", "source_url", "image", "imagem", "full", "original", "large", "medium", "thumbnail", "rendered", "guid", "sizes", "media_details"];
+  return keys.flatMap((key) => nestedImageValues(record[key], depth + 1));
+}
+
+function imageUrls(source: UnknownListingSourceRecord, baseUrl = "") {
+  const keys = [
+    "image", "imagem", "coverImage", "cover_image", "featuredImage", "featured_image", "foto", "photo",
+    "photoUrl", "foto_url", "urlImagem", "imagem_url", "thumbnail", "thumbnailUrl", "thumb", "capa",
+    "images", "imagens", "fotos", "photos", "gallery", "galeria", "imageGallery", "image_urls",
+  ];
+  const candidates = keys.flatMap((key) => nestedImageValues(source[key]));
+  const absolute = candidates.flatMap((candidate) => {
+    if (!candidate) return [];
+    if (/^https?:\/\//i.test(candidate)) return [candidate];
+    if (/^\/\//.test(candidate)) return [`https:${candidate}`];
+    if (!baseUrl) return [];
+    try { return [new URL(candidate, baseUrl).toString()]; } catch { return []; }
+  });
+  return normalizeListingImages(absolute).slice(0, 12);
+}
+function priceCents(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.round(value * 100));
+  const raw = text(value).replace(/[^\d,.-]/g, ""); if (!raw) return null;
+  const decimal = raw.includes(",") ? raw.replace(/\./g, "").replace(",", ".") : raw;
+  const parsed = Number(decimal); return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed * 100)) : null;
+}
+function sourceCategories(source: UnknownListingSourceRecord) {
+  const value = first(source, ["categories", "categorias", "categoryPath", "taxonomy"]);
+  const list = Array.isArray(value) ? value.map(text).filter(Boolean) : text(value) ? [text(value)] : [];
+  const singular = text(first(source, ["category", "categoria", "categoryName"]));
+  if (singular && !list.some((item) => plain(item) === plain(singular))) list.push(singular);
+  return list;
+}
+
+function firstPhone(source: UnknownListingSourceRecord) {
+  const value = first(source, ["whatsapp", "phone", "telefone", "telefones", "phones", "celular"]);
+  if (Array.isArray(value)) return value.map((item) => text(item)).find(Boolean) || "";
+  return text(value);
+}
+
+function sourceCategory(labels: string[], title: string) {
+  for (const label of labels) {
+    const exact = portalCategories.find((category) => plain(category.name) === plain(label));
+    if (exact) return exact.name;
+  }
+  for (const label of [...labels].reverse()) {
+    const mapped = mapCategory(label, title);
+    if (mapped !== "Outros") return mapped;
+  }
+  return mapCategory(labels.join(" "), title);
+}
+
+function sourceSubcategory(category: string, labels: string[]) {
+  const remaining = labels.filter((label) => plain(label) !== plain(category));
+  const joined = plain(remaining.join(" "));
+  if (category === "Veículos") {
+    if (/\bmoto|motocic|scooter\b/.test(joined)) return "Motos";
+    if (/caminh|carreta|truck/.test(joined)) return "Caminhões";
+    if (/onibus|ônibus/.test(joined)) return "Ônibus";
+    if (/barco|lancha|aeronave|aviao|avião/.test(joined)) return "Barcos e aeronaves";
+    if (/carro|automovel|automóvel|utilitario|utilitário|van/.test(joined)) return "Carros, vans e utilitários";
+  }
+  const configured = portalCategories.find((item) => plain(item.name) === plain(category));
+  return configured?.subs.find((sub) => {
+    const normalized = plain(sub);
+    return remaining.some((label) => normalized.includes(plain(label)) || plain(label).includes(normalized));
+  }) || remaining[0] || "";
+}
+
+export function normalizeListingSourceRecord(source: UnknownListingSourceRecord, index: number): ImportRecord | null {
+  const title = text(first(source, ["title", "titulo", "name", "nome"])); if (!title) return null;
+  const rawId = text(first(source, ["slug", "url_slug", "id", "_id", "codigo", "code"]));
+  const seller = first(source, ["seller", "vendedor", "anunciante"]); const sellerRecord = seller && typeof seller === "object" ? seller as UnknownListingSourceRecord : {};
+  const sellerName = typeof seller === "string" ? text(seller) : "";
+  const price = priceCents(first(source, ["price", "preco", "valor", "value"]));
+  const labels = sourceCategories(source);
+  const category = sourceCategory(labels, title);
+  const publishedAt = text(first(source, ["createdAt", "created_at", "publishedAt", "data_publicacao", "date"]));
+  const createdAt = Number.isFinite(Date.parse(publishedAt)) ? new Date(publishedAt).toISOString() : new Date().toISOString();
+  const sourceUrl = text(first(source, ["link", "url", "externalUrl", "sourceUrl"]));
+  return {
+    id: `import-${slug(rawId || title, index)}`,
+    title: title.slice(0, 120),
+    description: text(first(source, ["description", "descricao", "content", "conteudo"])).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 5000) || `Anúncio importado: ${title}`,
+    category,
+    subcategory: text(first(source, ["subcategory", "subcategoria", "subCategory", "categoryChild"])) || sourceSubcategory(category, labels),
+    priceCents: price,
+    negotiable: price == null || price === 0,
+    images: imageUrls(source, sourceUrl),
+    displayName: text(first(sellerRecord, ["name", "nome"])) || sellerName || text(first(source, ["sellerName", "nomeVendedor"])) || "Importação de anúncios",
+    whatsapp: (text(first(sellerRecord, ["whatsapp", "phone", "telefone"])) || firstPhone(source)).replace(/\D/g, "").slice(-13) || "31000000000",
+    createdAt,
+    sourceId: text(first(source, ["id", "_id", "codigo", "code"])),
+    sourceUrl,
+    sourceCategories: labels,
+  };
+}
+
+export function makeListingSourceRecordsUnique(records: ImportRecord[]) {
+  const seen = new Set<string>();
+  return records.map((record, index) => {
+    if (!seen.has(record.id)) {
+      seen.add(record.id);
+      return record;
+    }
+    const suffix = slug(record.sourceId || String(index + 1), index).slice(-32);
+    let id = `${record.id}-${suffix}`;
+    let attempt = 2;
+    while (seen.has(id)) id = `${record.id}-${suffix}-${attempt++}`;
+    seen.add(id);
+    return { ...record, id };
+  });
+}
+function validateSourceUrl(value: string) {
+  const url = new URL(value); if (!/^https?:$/.test(url.protocol)) throw new Error("Use um endereço HTTP ou HTTPS.");
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === "localhost" || hostname.endsWith(".local") || /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostname)) throw new Error("O endereço de importação não pode apontar para uma rede privada.");
+  return url.toString();
+}
+
+function plain(value: string) {
+  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("pt-BR");
+}
+
+/**
+ * Classificação local e determinística. Ela é deliberadamente rápida: não faz
+ * chamadas externas e permite processar milhares de anúncios em poucos lotes.
+ */
+export function classifyListingLocally(record: ImportRecord, categories: Pick<PortalCategory, "name" | "subs">[]) {
+  const source = plain(`${record.category} ${record.subcategory} ${record.title} ${record.description}`);
+  const properties = categories.find((item) => plain(item.name) === plain("Imóveis"));
+  if (/\b(?:jazig|sepultur|tumul|cemiteri)/i.test(source) && properties?.subs.includes("Jazigos")) {
+    return { category: "Imóveis", subcategory: "Jazigos" };
+  }
+  const commerce = categories.find((item) => plain(item.name) === plain("Comércio e Negócios"));
+  if (/\b(?:transferencia de negocios|negocio em transferencia|repasse de negocio|passo o ponto|transfiro (?:o )?negocio)\b/i.test(source) && commerce?.subs.includes("Transferência de Negócios")) {
+    return { category: "Comércio e Negócios", subcategory: "Transferência de Negócios" };
+  }
+  if (/\b(?:cotas? de clube|cotas? sociais?|clube(?:s)? e acoes|cotas?, clubes? e acoes)\b/i.test(source) && commerce?.subs.includes("Cotas, Clubes e Ações")) {
+    return { category: "Comércio e Negócios", subcategory: "Cotas, Clubes e Ações" };
+  }
+  const category = mapCategory(record.category, `${record.title} ${record.description}`);
+  const configured = categories.find((item) => plain(item.name) === plain(category));
+  const direct = configured?.subs.find((item) => source.includes(plain(item)));
+  if (direct) return { category, subcategory: direct };
+
+  const rules: Record<string, Array<[RegExp, string]>> = {
+    "Veículos": [
+      [/\bmoto|motocic|scooter|biz|cg\b/i, "Motos"],
+      [/caminh|carreta|truck/i, "Caminhões"],
+      [/onibus|ônibus/i, "Ônibus"],
+      [/barco|lancha|aeronave|aviao|avião/i, "Barcos e aeronaves"],
+      [/./, "Carros, vans e utilitários"],
+    ],
+    "Imóveis": [
+      [/jazig|sepultur|túmul|tumul|cemitéri|cemiteri/i, "Jazigos"],
+      [/alug|locaç|locacao/i, "Aluguel — casas e apartamentos"],
+      [/temporada|diaria|diária/i, "Temporada"],
+      [/terreno|lote|sitio|sítio|fazenda|chacara|chácara/i, "Terrenos, sítios e fazendas"],
+      [/loja|galpao|galpão|sala comercial|industrial/i, "Comércio e indústria"],
+      [/lançamento|lancamento|novo/i, "Imóvel novo"],
+      [/./, "Venda — casas e apartamentos"],
+    ],
+    "Comércio e Negócios": [
+      [/transferencia|repasse|passo o ponto|transfiro/i, "Transferência de Negócios"],
+      [/\bcotas?\b|\bclubes?\b|\bacoes?\b/i, "Cotas, Clubes e Ações"],
+    ],
+    "Empregos": [[/tecnologia|program|desenvolv|suporte|ti\b/i, "Tecnologia"], [/venda|comercial/i, "Comercial e vendas"], [/saude|saúde|enferm|medic/i, "Saúde"]],
+  };
+  const match = rules[category]?.find(([pattern]) => pattern.test(source))?.[1];
+  return { category, subcategory: match || record.subcategory || configured?.subs[0] || "Outros" };
+}
+
+async function ensureTables() {
+  const { env } = await import("cloudflare:workers"); await ensureListingTables();
+  await env.DB.batch([
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS portal_import_jobs (id TEXT PRIMARY KEY NOT NULL, source_url TEXT NOT NULL,
+      status TEXT NOT NULL, total INTEGER NOT NULL DEFAULT 0, processed INTEGER NOT NULL DEFAULT 0, imported INTEGER NOT NULL DEFAULT 0,
+      updated INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS portal_import_queue (job_id TEXT NOT NULL, listing_id TEXT NOT NULL, position INTEGER NOT NULL,
+      payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY (job_id, listing_id))`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS portal_import_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+      listing_id TEXT NOT NULL, title TEXT NOT NULL, category TEXT, subcategory TEXT, status TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL)`),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS portal_import_queue_status_idx ON portal_import_queue (job_id, status, position)"),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS portal_import_logs_job_idx ON portal_import_logs (job_id, id DESC)"),
+  ]);
+}
+
+export async function startListingImport(sourceUrl: string) {
+  const url = validateSourceUrl(sourceUrl.trim()); await ensureTables();
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 15000);
+  let response: Response;
+  try { response = await fetch(url, { signal: controller.signal, headers: { accept: "application/json" } }); }
+  finally { clearTimeout(timeout); }
+  if (!response.ok) throw new Error(`O endereço de importação respondeu com HTTP ${response.status}.`);
+  const json: unknown = await response.json().catch(() => { throw new Error("O endereço não retornou um JSON válido."); });
+  const root = json && typeof json === "object" ? json as UnknownListingSourceRecord : {};
+  const collection = Array.isArray(json) ? json : first(root, ["listings", "anuncios", "ads", "items", "data"]);
+  if (!Array.isArray(collection)) throw new Error("O JSON não contém uma lista de anúncios reconhecida.");
+  const normalized = collection.slice(0, 3000).flatMap((item, index) => item && typeof item === "object" ? [normalizeListingSourceRecord(item as UnknownListingSourceRecord, index)].filter((record): record is ImportRecord => Boolean(record)) : []);
+  const records = makeListingSourceRecordsUnique(normalized);
+  if (!records.length) throw new Error("Nenhum anúncio válido foi encontrado no JSON.");
+  const userId = await ensureImportCustomer(); await writePortalSettings({ listing_import_url: url });
+  const { env } = await import("cloudflare:workers"); const id = crypto.randomUUID(); const now = new Date().toISOString();
+  await env.DB.prepare("INSERT INTO portal_import_jobs (id, source_url, status, total, created_at, updated_at) VALUES (?, ?, 'running', ?, ?, ?)").bind(id, url, records.length, now, now).run();
+  for (let offset = 0; offset < records.length; offset += 40) {
+    await env.DB.batch(records.slice(offset, offset + 40).map((record, index) => env.DB.prepare(`INSERT INTO portal_import_queue
+      (job_id, listing_id, position, payload_json, status) VALUES (?, ?, ?, ?, 'pending')`)
+      .bind(id, record.id, offset + index, JSON.stringify({ ...record, userId }))));
+  }
+  return getListingImport(id);
+}
+
+export async function processNextListingImport(jobId: string, categories: Pick<PortalCategory, "name" | "subs">[]) {
+  await ensureTables(); const { env } = await import("cloudflare:workers");
+  const row = await env.DB.prepare("SELECT listing_id AS listingId, payload_json AS payloadJson FROM portal_import_queue WHERE job_id = ? AND status = 'pending' ORDER BY position LIMIT 1")
+    .bind(jobId).first<{ listingId: string; payloadJson: string }>();
+  if (!row) { await env.DB.prepare("UPDATE portal_import_jobs SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'running'").bind(new Date().toISOString(), jobId).run(); return getListingImport(jobId); }
+  await env.DB.prepare("UPDATE portal_import_queue SET status = 'processing' WHERE job_id = ? AND listing_id = ?").bind(jobId, row.listingId).run();
+  const record = JSON.parse(row.payloadJson) as ImportRecord & { userId: number }; const now = new Date().toISOString();
+  try {
+    const classification = classifyListingLocally(record, categories);
+    const location = { label: "Belo Horizonte, MG", latitude: -19.9166813, longitude: -43.9344931 };
+    // As URLs originais deixam o anúncio visível imediatamente. A otimização das
+    // imagens pode ser executada depois, sem bloquear a publicação do catálogo.
+    const images = record.images;
+    const existing = await env.DB.prepare("SELECT id FROM portal_listings WHERE id = ? LIMIT 1").bind(record.id).first();
+    await env.DB.prepare(`INSERT INTO portal_listings (id, user_id, title, description, negotiation_type, category, subcategory,
+      price_cents, monthly_rent_cents, iptu_cents, condo_cents, negotiable, address, latitude, longitude, display_name, whatsapp,
+      attributes_json, features_json, images_json, cover_image, publication_type, featured_plan, featured_until, expires_at, status,
+      payment_provider, payment_reference, payment_method, payment_amount_cents, payment_expires_at, payment_status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'Venda', ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, 'free', NULL, NULL, NULL,
+        'active', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, title=excluded.title, description=excluded.description,
+        category=excluded.category, subcategory=excluded.subcategory, price_cents=excluded.price_cents, negotiable=excluded.negotiable,
+        address=excluded.address, latitude=excluded.latitude, longitude=excluded.longitude, display_name=excluded.display_name,
+        whatsapp=excluded.whatsapp, attributes_json=excluded.attributes_json, images_json=excluded.images_json,
+        cover_image=excluded.cover_image, status='active', created_at=excluded.created_at, updated_at=excluded.updated_at`)
+      .bind(record.id, record.userId, record.title, record.description, classification.category, classification.subcategory,
+        record.priceCents, record.negotiable ? 1 : 0, location.label, String(location.latitude), String(location.longitude),
+        record.displayName, record.whatsapp, JSON.stringify({ sourceUrl: record.sourceUrl, sourceCategories: record.sourceCategories }),
+        JSON.stringify(images), images[0] || LISTING_IMAGE_PLACEHOLDER, record.createdAt, now).run();
+    await ensureListingSlugs([{ key: storedListingKey(record.id), id: record.id, title: record.title, table: "portal_listings" }]);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE portal_import_queue SET status = 'completed' WHERE job_id = ? AND listing_id = ?").bind(jobId, row.listingId),
+      env.DB.prepare(`INSERT INTO portal_import_logs (job_id, listing_id, title, category, subcategory, status, message, created_at)
+        VALUES (?, ?, ?, ?, ?, 'completed', ?, ?)`).bind(jobId, row.listingId, record.title, classification.category, classification.subcategory, `${existing ? "Atualizado" : "Importado"} · ${images.length} foto(s) · classificação local`, now),
+      env.DB.prepare(`UPDATE portal_import_jobs SET processed=processed+1, ${existing ? "updated=updated+1" : "imported=imported+1"}, updated_at=? WHERE id=?`).bind(now, jobId),
+      env.DB.prepare("UPDATE portal_users SET active_ads = (SELECT COUNT(*) FROM portal_listings WHERE user_id = ?), updated_at = ? WHERE id = ?").bind(record.userId, now, record.userId),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 300) : "Falha desconhecida";
+    await env.DB.batch([
+      env.DB.prepare("UPDATE portal_import_queue SET status = 'failed' WHERE job_id = ? AND listing_id = ?").bind(jobId, row.listingId),
+      env.DB.prepare("INSERT INTO portal_import_logs (job_id, listing_id, title, status, message, created_at) VALUES (?, ?, ?, 'failed', ?, ?)").bind(jobId, row.listingId, record.title, message, now),
+      env.DB.prepare("UPDATE portal_import_jobs SET processed=processed+1, failed=failed+1, updated_at=? WHERE id=?").bind(now, jobId),
+    ]);
+  }
+  const pending = await env.DB.prepare("SELECT 1 FROM portal_import_queue WHERE job_id = ? AND status = 'pending' LIMIT 1").bind(jobId).first();
+  if (!pending) await env.DB.prepare("UPDATE portal_import_jobs SET status='completed', updated_at=? WHERE id=?").bind(new Date().toISOString(), jobId).run();
+  return getListingImport(jobId);
+}
+
+export async function processListingImportBatch(jobId: string, categories: Pick<PortalCategory, "name" | "subs">[], limit = 50) {
+  let state = await getListingImport(jobId);
+  for (let index = 0; index < limit && state.job && state.job.status === "running"; index += 1) {
+    state = await processNextListingImport(jobId, categories);
+  }
+  return state;
+}
+
+export async function synchronizeImportedListings(categories: Pick<PortalCategory, "name" | "subs">[]) {
+  await ensureTables();
+  const { env } = await import("cloudflare:workers");
+  await ensureImportCustomer();
+  const rows = (await env.DB.prepare(`SELECT id, title, description, category, subcategory,
+    price_cents AS priceCents, negotiable, images_json AS imagesJson, display_name AS displayName, whatsapp
+    FROM portal_listings WHERE user_id IN (SELECT id FROM portal_users WHERE lower(email) IN (lower(?), lower('importacao@palcao.com.br')))
+    ORDER BY created_at DESC`).bind(IMPORT_ACCOUNT_EMAIL).all<{
+      id: string; title: string; description: string; category: string; subcategory: string;
+      priceCents: number | null; negotiable: number; imagesJson: string; displayName: string; whatsapp: string;
+    }>()).results;
+  const now = new Date().toISOString();
+  for (let offset = 0; offset < rows.length; offset += 80) {
+    await env.DB.batch(rows.slice(offset, offset + 80).map((row) => {
+      const classification = classifyListingLocally({ ...row, negotiable: Boolean(row.negotiable), images: [], displayName: row.displayName,
+        whatsapp: row.whatsapp, createdAt: now, sourceId: row.id, sourceUrl: "", sourceCategories: [row.category, row.subcategory].filter(Boolean) }, categories);
+      return env.DB.prepare("UPDATE portal_listings SET category = ?, subcategory = ?, status = 'active', updated_at = ? WHERE id = ?")
+        .bind(classification.category, classification.subcategory, now, row.id);
+    }));
+  }
+  await env.DB.prepare(`UPDATE portal_users SET active_ads = (SELECT COUNT(*) FROM portal_listings WHERE user_id=portal_users.id), updated_at = ?
+    WHERE lower(email) IN (lower(?), lower('importacao@palcao.com.br'))`).bind(now, IMPORT_ACCOUNT_EMAIL).run();
+  return { synchronized: rows.length, importUserEmail: IMPORT_ACCOUNT_EMAIL };
+}
+
+export async function getListingImport(id?: string) {
+  await ensureTables(); const { env } = await import("cloudflare:workers");
+  const job = id ? await env.DB.prepare("SELECT id, source_url AS sourceUrl, status, total, processed, imported, updated, failed, created_at AS createdAt, updated_at AS updatedAt FROM portal_import_jobs WHERE id=?").bind(id).first()
+    : await env.DB.prepare("SELECT id, source_url AS sourceUrl, status, total, processed, imported, updated, failed, created_at AS createdAt, updated_at AS updatedAt FROM portal_import_jobs ORDER BY created_at DESC LIMIT 1").first();
+  const logs = job ? (await env.DB.prepare("SELECT listing_id AS listingId, title, category, subcategory, status, message, created_at AS createdAt FROM portal_import_logs WHERE job_id=? ORDER BY id DESC LIMIT 200").bind(String(job.id)).all()).results : [];
+  return { job: job || null, logs, importUserEmail: IMPORT_ACCOUNT_EMAIL };
+}

@@ -1,0 +1,1 @@
+ALTER TABLE "portal_payments" ALTER COLUMN "provider" SET DEFAULT 'mercadopago';

@@ -1,0 +1,1 @@
+import { NextResponse } from "next/server";import { getSitePages } from "../../../db/site-pages";export async function GET(){return NextResponse.json({pages:(await getSitePages()).filter(page=>page.active)},{headers:{"Cache-Control":"public, max-age=60, s-maxage=300"}});}
